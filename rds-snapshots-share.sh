@@ -1,45 +1,70 @@
 #!/bin/bash
 
-# ================================================================== 
+# ==================================================================
 # Script to share and restore RDS snapshots between AWS accounts
 # ==================================================================
 
-# Configuration - MUST BE DEFINED BEFORE RUNNING
-RDS=()
+# Function to print error messages and exit
+error_exit() {
+    echo "❌ ERROR: $1"
+    exit 1
+}
 
-FROM_ACCOUNT_PROFILE=""
-FROM_ACCOUNT_ID=""
-FROM_REGION=""
+# Source the configuration file
+if [ -f ".env" ]; then
+    source .env
+else
+    error_exit "Configuration file '.env' not found."
+fi
 
-TO_ACCOUNT_PROFILE=""
-TO_ACCOUNT_ID=""
-TO_REGION=""
-TO_SG_ID=""
-DB_SUBNET_GROUP=""
+STATE_FILE=".rds_share_state"
 
-MASTER_PASSWORD=""
+# Function to add a processed database to the state file
+add_to_state() {
+    echo "$1" >> "$STATE_FILE"
+}
 
-# Validate required variables
-if [ -z "$FROM_ACCOUNT_PROFILE" ] || [ -z "$FROM_ACCOUNT_ID" ] || [ -z "$FROM_REGION" ] || \
-   [ -z "$TO_ACCOUNT_PROFILE" ] || [ -z "$TO_ACCOUNT_ID" ] || [ -z "$TO_REGION" ] || \
-   [ -z "$TO_SG_ID" ] || [ -z "$DB_SUBNET_GROUP" ] || [ -z "$MASTER_PASSWORD" ] || \
-   [ ${#RDS[@]} -eq 0 ]; then
-    echo "❌ ERROR: Required variables not configured"
-    echo ""
-    echo "Please define the following variables before running:"
-    echo "  • RDS=(\"db1\" \"db2\" \"db3\")"
-    echo "  • FROM_ACCOUNT_PROFILE=\"source-profile\""
-    echo "  • FROM_ACCOUNT_ID=\"123456789012\""
-    echo "  • FROM_REGION=\"us-east-1\""
-    echo "  • TO_ACCOUNT_PROFILE=\"destination-profile\""
-    echo "  • TO_ACCOUNT_ID=\"210987654321\""
-    echo "  • TO_REGION=\"us-east-2\""
-    echo "  • TO_SG_ID=\"sg-xxxxxxxxx\""
-    echo "  • DB_SUBNET_GROUP=\"subnet-group-name\""
-    echo "  • MASTER_PASSWORD=\"secure-password\""
-    echo ""
+# Function to check if a database has been processed
+is_processed() {
+    if [ -f "$STATE_FILE" ]; then
+        grep -q "^$1$" "$STATE_FILE"
+    else
+        return 1
+    fi
+}
+
+# Check for existing state file and prompt for continuation
+if [ -f "$STATE_FILE" ]; then
+    echo "A previous session was detected. Do you want to resume from where it left off? (y/N)"
+    read -p "Enter 'y' to resume or 'N' to start fresh (this will clear the state file): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Clearing previous state..."
+        rm "$STATE_FILE"
+    else
+        echo "Resuming previous session..."
+    fi
+fi
+
+# Run the validation script
+if [ -f "validate.sh" ]; then
+    ./validate.sh
+    if [ $? -ne 0 ]; then
+        echo "Validation failed. Exiting."
+        exit 1
+    fi
+else
+    echo "⚠️  WARNING: Validation script 'validate.sh' not found. Skipping validation."
+fi
+
+# Securely prompt for the master password
+read -s -p "Enter the master password for the new RDS clusters: " MASTER_PASSWORD
+echo ""
+if [ -z "$MASTER_PASSWORD" ]; then
+    echo "❌ ERROR: Master password cannot be empty."
     exit 1
 fi
+
 
 # Function to check snapshots in progress
 check_snapshots_in_progress() {
@@ -77,20 +102,24 @@ configure_kms_permissions() {
     
     echo "🔐 Configuring temporary KMS permissions..."
     
+    local temp_dir=$(mktemp -d)
+    local backup_file="$temp_dir/kms-policy-backup.json"
+    local temp_file="$temp_dir/kms-policy-temp.json"
+
     echo "Saving current KMS policy..."
     aws kms --no-cli-pager get-key-policy \
         --key-id "$kms_key_id" \
         --policy-name default \
         --profile "$FROM_ACCOUNT_PROFILE" \
         --region "$FROM_REGION" \
-        --output json > /tmp/kms-policy-backup.json
+        --output json > "$backup_file"
     
     if [ $? -ne 0 ]; then
         echo "❌ Error saving current KMS policy"
         return 1
     fi
     
-    cat > /tmp/kms-policy-temp.json << EOF
+    cat > "$temp_file" << EOF
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -110,11 +139,10 @@ configure_kms_permissions() {
         "AWS": "arn:aws:iam::$TO_ACCOUNT_ID:root"
       },
       "Action": [
-        "kms:Decrypt",
         "kms:CreateGrant",
-        "kms:ReEncrypt*",
-        "kms:GenerateDataKey*",
-        "kms:DescribeKey"
+        "kms:Decrypt",
+        "kms:DescribeKey",
+        "kms:ReEncrypt*"
       ],
       "Resource": "*"
     }
@@ -123,12 +151,7 @@ configure_kms_permissions() {
 EOF
     
     echo "Applying temporary KMS policy..."
-    aws kms --no-cli-pager put-key-policy \
-        --key-id "$kms_key_id" \
-        --policy-name default \
-        --policy file:///tmp/kms-policy-temp.json \
-        --profile "$FROM_ACCOUNT_PROFILE" \
-        --region "$FROM_REGION"
+    aws kms --no-cli-pager put-key-policy         --key-id "$kms_key_id"         --policy-name default         --policy file://"$temp_file"         --profile "$FROM_ACCOUNT_PROFILE"         --region "$FROM_REGION"
     
     if [ $? -eq 0 ]; then
         echo "✅ Temporary KMS policy configured"
@@ -145,13 +168,13 @@ restore_kms_permissions() {
     
     echo "🔐 Restoring original KMS policy..."
     
-    if [ -f "/tmp/kms-policy-backup.json" ]; then
-        jq -r '.Policy' /tmp/kms-policy-backup.json > /tmp/kms-policy-restore.json
+    if [ -f "$backup_file" ]; then
+        jq -r '.Policy' "$backup_file" > "$temp_dir/kms-policy-restore.json"
         
         aws kms --no-cli-pager put-key-policy \
             --key-id "$kms_key_id" \
             --policy-name default \
-            --policy file:///tmp/kms-policy-restore.json \
+            --policy file://"$temp_dir/kms-policy-restore.json" \
             --profile "$FROM_ACCOUNT_PROFILE" \
             --region "$FROM_REGION"
         
@@ -159,10 +182,10 @@ restore_kms_permissions() {
             echo "✅ Original KMS policy restored"
         else
             echo "⚠️  Error restoring original KMS policy"
-            echo "⚠️  Backup saved at: /tmp/kms-policy-backup.json"
+            echo "⚠️  Backup saved at: $temp_dir/kms-policy-backup.json"
         fi
         
-        rm -f /tmp/kms-policy-temp.json /tmp/kms-policy-restore.json
+        rm -rf "$temp_dir"
     else
         echo "⚠️  KMS policy backup file not found"
     fi
@@ -172,6 +195,11 @@ restore_kms_permissions() {
 echo "Checking dependencies..."
 if ! command -v aws &> /dev/null; then
     echo "❌ AWS CLI not found. Please install AWS CLI."
+    exit 1
+fi
+
+if ! command -v jq &> /dev/null; then
+    echo "❌ jq not found. Please install jq to proceed."
     exit 1
 fi
 
@@ -246,18 +274,27 @@ SUCCESS_COUNT=0
 FAILED_DATABASES=()
 
 for db in "${RDS[@]}"; do
-    CLUSTER_ID="${db}-sandbox-$(date +%Y%m%d%H%M)"
-    INSTANCE_ID="${db}-instance-sandbox-$(date +%Y%m%d%H%M)"
-    SNAPSHOT_COPY="${db}-copy-$(date +%Y%m%d%H%M)"
-    MANUAL_SNAPSHOT="${db}-manual-$(date +%Y%m%d%H%M)"
-    SNAPSHOT_CROSS_ACCOUNT="${db}-cross-account-$(date +%Y%m%d%H%M)"
+    if is_processed "$db"; then
+        echo "⏭️  Skipping database $db - already processed in a previous run."
+        PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+        continue
+    fi
+
+    # Generate unique identifiers for the current database processing
+    TIMESTAMP=$(date +%Y%m%d%H%M%S)
+    CLUSTER_ID="${db}-sandbox-${TIMESTAMP}"
+    INSTANCE_ID="${db}-instance-sandbox-${TIMESTAMP}"
+    SNAPSHOT_COPY="${db}-copy-${TIMESTAMP}"
+    MANUAL_SNAPSHOT="${db}-manual-${TIMESTAMP}"
+    SNAPSHOT_CROSS_ACCOUNT="${db}-cross-account-${TIMESTAMP}"
     
     echo -e "\n\033[1;34m===== Processing database: $db =====\033[0m"
 
     EXISTING_CLUSTER=$(aws rds --no-cli-pager describe-db-clusters \
         --profile "$TO_ACCOUNT_PROFILE" \
         --region "$TO_REGION" \
-        --query "DBClusters[?starts_with(DBClusterIdentifier, \`${db}-sandbox\`)].DBClusterIdentifier" \
+        --query "DBClusters[?starts_with(DBClusterIdentifier, '${db}-sandbox')].DBClusterIdentifier" \
         --output text \
         --no-cli-pager 2>/dev/null || echo "")
     
@@ -525,12 +562,31 @@ for db in "${RDS[@]}"; do
     fi
 
     echo -e "\nRestoring cluster: $CLUSTER_ID"
+
+    # Dynamically get engine and version from the snapshot
+    SNAPSHOT_DETAILS=$(aws rds --no-cli-pager describe-db-cluster-snapshots \
+        --profile "$TO_ACCOUNT_PROFILE" \
+        --db-cluster-snapshot-identifier "$FINAL_SNAPSHOT" \
+        --region "$CHECK_REGION" \
+        --query 'DBClusterSnapshots[0].{Engine:Engine,EngineVersion:EngineVersion}' \
+        --output json)
+
+    ENGINE=$(echo "$SNAPSHOT_DETAILS" | jq -r '.Engine')
+    ENGINE_VERSION=$(echo "$SNAPSHOT_DETAILS" | jq -r '.EngineVersion')
+
+    if [ -z "$ENGINE" ] || [ "$ENGINE" = "null" ] || [ -z "$ENGINE_VERSION" ] || [ "$ENGINE_VERSION" = "null" ]; then
+        echo "❌ Error: Could not determine Engine or Engine Version from snapshot. Skipping..."
+        continue
+    fi
+
+    echo "Restoring with Engine: $ENGINE and Version: $ENGINE_VERSION"
+
     aws rds --no-cli-pager restore-db-cluster-from-snapshot \
         --profile "$TO_ACCOUNT_PROFILE" \
         --db-cluster-identifier "$CLUSTER_ID" \
         --snapshot-identifier "$FINAL_SNAPSHOT" \
-        --engine aurora-postgresql \
-        --engine-version "13.18" \
+        --engine "$ENGINE" \
+        --engine-version "$ENGINE_VERSION" \
         --db-subnet-group-name "$DB_SUBNET_GROUP" \
         --vpc-security-group-ids "$TO_SG_ID" \
         --region "$TO_REGION"
@@ -542,12 +598,26 @@ for db in "${RDS[@]}"; do
         --region "$TO_REGION"
     echo "Cluster available: $CLUSTER_ID"
 
+    echo -e "\nConfiguring auto-scaling first (required for Serverless V2)"
+    aws rds --no-cli-pager modify-db-cluster \
+        --profile "$TO_ACCOUNT_PROFILE" \
+        --db-cluster-identifier "$CLUSTER_ID" \
+        --serverless-v2-scaling-configuration MinCapacity=0.5,MaxCapacity=1 \
+        --apply-immediately \
+        --region "$TO_REGION"
+
+    echo -e "\nWaiting for cluster modification to complete..."
+    aws rds --no-cli-pager wait db-cluster-available \
+        --profile "$TO_ACCOUNT_PROFILE" \
+        --db-cluster-identifier "$CLUSTER_ID" \
+        --region "$TO_REGION"
+
     echo -e "\nCreating Serverless V2 instance: $INSTANCE_ID"
     if ! aws rds --no-cli-pager create-db-instance \
         --profile "$TO_ACCOUNT_PROFILE" \
         --db-instance-identifier "$INSTANCE_ID" \
         --db-cluster-identifier "$CLUSTER_ID" \
-        --engine aurora-postgresql \
+        --engine "$ENGINE" \
         --db-instance-class db.serverless \
         --region "$TO_REGION"; then
         echo "⚠️  Error creating instance, but cluster was created successfully"
@@ -564,21 +634,37 @@ for db in "${RDS[@]}"; do
         fi
     fi
 
-    echo -e "\nConfiguring auto-scaling"
-    aws rds --no-cli-pager modify-db-cluster \
+    echo -e "\nWaiting for cluster to be ready for password reset..."
+    # Wait a bit more to ensure cluster is not in backing-up state
+    sleep 30
+    
+    # Check cluster status before attempting password reset
+    CLUSTER_STATUS=$(aws rds --no-cli-pager describe-db-clusters \
         --profile "$TO_ACCOUNT_PROFILE" \
         --db-cluster-identifier "$CLUSTER_ID" \
-        --serverless-v2-scaling-configuration MinCapacity=0.5,MaxCapacity=1 \
-        --apply-immediately \
-        --region "$TO_REGION"
+        --query 'DBClusters[0].Status' \
+        --output text \
+        --region "$TO_REGION")
+    
+    if [ "$CLUSTER_STATUS" != "available" ]; then
+        echo "⏳ Waiting for cluster to become available (current status: $CLUSTER_STATUS)..."
+        aws rds --no-cli-pager wait db-cluster-available \
+            --profile "$TO_ACCOUNT_PROFILE" \
+            --db-cluster-identifier "$CLUSTER_ID" \
+            --region "$TO_REGION"
+    fi
 
     echo -e "\nResetting master password"
-    aws rds --no-cli-pager modify-db-cluster \
+    if ! aws rds --no-cli-pager modify-db-cluster \
         --profile "$TO_ACCOUNT_PROFILE" \
         --db-cluster-identifier "$CLUSTER_ID" \
         --master-user-password "$MASTER_PASSWORD" \
         --apply-immediately \
-        --region "$TO_REGION"
+        --region "$TO_REGION"; then
+        echo "⚠️  Error resetting master password. You may need to reset it manually in AWS Console."
+    else
+        echo "✅ Master password reset successfully"
+    fi
 
     ENDPOINT=$(aws rds --no-cli-pager describe-db-clusters \
         --profile "$TO_ACCOUNT_PROFILE" \
@@ -593,7 +679,7 @@ for db in "${RDS[@]}"; do
     echo "Endpoint: $ENDPOINT"
     echo "Port: 5432"
     echo "Master user: admin_user"
-    echo "Password: $MASTER_PASSWORD"
+    echo "Password: <sensitive>"
     echo "Region: $TO_REGION"
     
     # Clean up snapshots based on scenario
@@ -632,8 +718,8 @@ for db in "${RDS[@]}"; do
 
     PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
     SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    add_to_state "$db"
     echo -e "\n✅ \033[1;32mDatabase $db processed successfully! ($SUCCESS_COUNT/${#RDS[@]})\033[0m"
-
 done
 
 restore_kms_permissions "$KMS_KEY_ID"
